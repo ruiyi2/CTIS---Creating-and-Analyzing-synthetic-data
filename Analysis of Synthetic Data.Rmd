@@ -1,0 +1,766 @@
+---
+title: "CTIS - Creating and Analyzing Synthetic Data"
+author: Anar Battaivan, Sophia Berger, Anna Fuchs, Thao Tran, Ruiyi Wang and Joshua
+  Weinert
+date: '2022-08-21'
+output:
+  pdf_document: default
+  html_document: default
+---
+In April of 2020, a rapid worldwide COVID-19 symptom and contact behavior survey has been launched under the name "The University of Maryland Social Data Science Center Global COVID-19 Trends and Impact Survey, in partnership with Facebook" (CTIS) as a joint initiative between academic institutions and Facebook, to collect data on current symptoms, testing outcomes, social distancing behavior, vaccine acceptance, financial constraints and mental health issues like depression and anxiety. The survey is available in 56 languages and invites a representative sample of Facebook users to report on various questions regarding the topics stated above on a daily basis.
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+```{r clear environment}
+# We start with an empty environment.
+SWITCH_clear_environment <- 1
+
+if (SWITCH_clear_environment == 1) {
+  rm(list = ls())
+  gc()
+}
+```
+
+# INFO & SET-UP 
+
+This file is part of the CTIS Seminar codebook. 
+
+NOTE: To reduce the risk of accidentally overwriting files or starting computationally intense processes, all "dangerous" chunks have a variable called "SWITCH" that can be toggled to execute the code.
+
+Created:  15 June 2022
+Inputs:   ...
+Outputs:  ...
+
+# Setup: Import libraries
+```{r Setup: Import libraries}
+# If you don't already have CTIS, "uncomment" the command below and run it before
+# the rest.
+# devtools::install_github("CaroHaensch/CTIS")
+
+need <- c("CTIS",
+          "devtools",
+          "doParallel",
+          "foreach",
+          "lubridate",
+          "synthpop",
+          "tidyverse")
+have <- need %in% rownames(installed.packages())
+if(any(!have)) install.packages(need[!have])
+invisible(lapply(need, library, character.only = TRUE))
+
+rm(need, have)
+
+```
+
+
+The data for CTIS is saved at https://gisumd.github.io/COVID-19-API-Documentation/. The following chunk uses the supplied API to access the daily data files for the time frame specified by startDate and endDate.
+
+## Dataset: Download microdata API
+```{r Dataset: Download microdata API}
+# The following function can then be used to download, save as a .csv, and load 
+# all at once the microdata for a specific date.
+
+SWITCH <- 0
+
+startDate <- "2020-07-01"
+endDate <- "2020-07-28"
+dayNum <- as.numeric(difftime(endDate, startDate, units = "days")) + 1
+
+if (SWITCH == 1) {
+    
+  API_login <- readRDS("API_login.RDS")
+  
+  # The function CTIS::CTIS_microdata can automatically download datasets from the
+  # central repository. Calls to the repository have the following structure
+  # CTIS_microdata(username = username,
+  #               password = password,
+  #               date = "2020-05-01")
+  # username and password are stored in API_login
+  
+  dir.create("files")
+  setwd("files")
+  
+  for (i in seq_len(dayNum)) {
+    date <- as.Date(startDate)
+    date <- date + days(i) - days(1)
+    CTIS_microdata(username = API_login$username,
+                   password = API_login$password,
+                   date = as.character(date))
+    print(sprintf("%s complete", date))
+  }
+  
+  setwd("..")
+  
+  rm(API_login, date, i)
+
+} else {print("API microdata download switch is turned off")}
+
+```
+
+
+## Dataset: Extract EU entries
+```{r Dataset: Extract EU entries}
+# This part of the code uses the files from above to extract all EU entries which
+# are affected by the deletion mandate and saves them in a new folder called 
+# "removed_files"
+
+dir.create("removed_files")
+countryList <- c("Austria",
+                 "Belgium",
+                 "Bulgaria",
+                 "Croatia",
+                 "Cyprus",
+                 "Czech Republic",
+                 "Denmark",
+                 "Estonia",
+                 "Finland",
+                 "France",
+                 "Germany",
+                 "Greece",
+                 "Hungary",
+                 "Ireland",
+                 "Italy",
+                 "Latvia",
+                 "Lithuania",
+                 "Luxembourg",
+                 "Malta",
+                 "Netherlands",
+                 "Poland",
+                 "Portugal",
+                 "Romania",
+                 "Slovakia",
+                 "Slovenia",
+                 "Spain",
+                 "Sweden",
+                 "United Kingdom",
+                 "Iceland",
+                 "Norway",
+                 "Andorra",
+                 "Switzerland")
+
+for (i in seq_len(dayNum)) {
+  date <- as.Date(startDate)
+  date <- date + days(i) - days(1)
+  
+  CTISData <- read.csv(file.path(getwd(),
+                                 "files",
+                                 sprintf("%s_parta.csv", date)))
+  CTISData$RecordedDate <- as.Date(CTISData$RecordedDate)
+  
+  CTISData2 <- CTISData %>%
+    filter(country_agg %in% countryList) %>%
+    select(-c(GID_0,
+              GID_1,
+              ISO_3,
+              NAME_0,
+              NAME_1,
+              region_agg,
+              country_region_numeric,
+              F3_au,
+              F3_de))
+  
+  write.csv(CTISData2,
+            file = file.path(getwd(),
+                             "removed_files",
+                             sprintf("%s_parta_rm.csv", date)),
+            row.names = FALSE)
+  
+  if (i == 1) {
+    CompleteData <- CTISData2
+  } else {
+    CompleteData <- rbind(CompleteData, CTISData2)
+  }
+  
+  rm(CTISData, CTISData2)
+  print(sprintf("%s complete", date))
+}
+
+write.csv(CTISData2,
+          file = file.path(getwd(),
+                           "removed_files",
+                           "All_Removed_Combined.csv"),
+          row.names = FALSE)
+
+
+rm(countryList, date, i)
+
+```
+
+After running the syn()-function in R, we realized that using R can be very time consuming, therefore, we will use the synthpop-package implementation in Python.
+
+# Python - Synthetic data: CART & Sample (single day)
+``` {python Synthetic data: CART & Sample, eval = FALSE}
+import os
+import numpy as np
+import pandas as pd
+from synthpop import Synthpop
+from datetime import date, timedelta
+
+if not os.path.exists('synthetic_files'):
+    os.mkdir('synthetic_files')
+
+def daterange(start_date, end_date):
+    for n in range(int((end_date - start_date).days)):
+        yield start_date + timedelta(n)
+
+start_date = date(2020, 7, 1)
+end_date = date(2020, 7, 29)
+
+dtypes2 = {'RecordedDate': 'category', 'survey_version': 'int', 'survey_region': 'category', 'weight': 'float', 'Finished': 'int','intro1': 'int', 'intro2': 'int', 'A1': 'int',  'A2_2_1': 'int', 'A2_2_2': 'int', 'B1_1': 'int', 'B1_2': 'int', 'B1_3': 'int', 'B1_4': 'int', 'B1_5': 'int', 'B1_6': 'int', 'B1_7': 'int', 'B1_8': 'int', 'B1_9': 'int', 'B1_10': 'int', 'B1_11': 'int', 'B1_12': 'int', 'B1_13': 'int', 'B2': 'float', 'B1b_x1': 'int', 'B1b_x2': 'int', 'B1b_x3': 'int', 'B1b_x4': 'int', 'B1b_x5': 'int', 'B1b_x6': 'int', 'B1b_x7': 'int', 'B1b_x8': 'int', 'B1b_x9': 'int', 'B1b_x10': 'int', 'B1b_x11': 'int', 'B1b_x12': 'int', 'B1b_x13': 'int', 'B3': 'int', 'B4': 'float', 'B5': 'int', 'B6': 'int', 'B7': 'int', 'B8': 'int', 'B9': 'int', 'B10': 'int', 'B11': 'int', 'B12_1': 'int', 'B12_2': 'int', 'B12_3': 'int', 'B12_4': 'int', 'B12_5': 'int', 'B12_6': 'int', 'B13_1': 'int', 'B13_2': 'int', 'B13_3': 'int', 'B13_4': 'int', 'B13_5': 'int', 'B13_6': 'int', 'B13_7': 'int', 'B14_1': 'int', 'B14_2': 'int', 'B14_3': 'int', 'B14_4': 'int', 'B14_5': 'int', 'C0_1': 'int', 'C0_2': 'int', 'C0_3': 'int', 'C0_4': 'int', 'C0_5': 'int', 'C0_6': 'int', 'C1_m': 'int', 'C2': 'int', 'C7': 'int', 'C8': 'int', 'C3': 'int', 'C5': 'int', 'C6': 'int', 'D1': 'int', 'D2': 'int', 'D3': 'int', 'D4': 'int', 'D5': 'int', 'D6_1': 'int', 'D6_2': 'int', 'D6_3': 'int', 'D7': 'int', 'D8': 'int', 'D9': 'int', 'D10': 'int', 'E3': 'int', 'E4': 'int', 'E6': 'float', 'E2': 'int', 'E5': 'float', 'E7': 'int', 'F1': 'int', 'F2_1': 'int', 'F2_2': 'int', 'Q_Language': 'category', 'Q_TotalDuration': 'int', 'country_agg': 'category', 'X1w_0unw': 'int'}
+
+for single_date in daterange(start_date, end_date):
+    var1 = os.getcwd() + '\\synthetic_files\\'
+    var2 = single_date.strftime("%Y-%m-%d")
+    var3 = "_parta_rm_synth"
+    var4 = "CART.csv"
+    var5 = "SAMPLE.csv"
+    
+    data = pd.read_csv(os.path.join(os.getcwd(), "removed_files", var2 + "_parta_rm.csv"))
+    
+    # By default, these variables are coded as type 'o'. Synthpop doesn't recognise
+    # this, however, so changing it to category which should just be a different name
+    data[["survey_region"]] = data[["survey_region"]].astype('category')
+    data[["RecordedDate"]] = data[["RecordedDate"]].astype('category')
+    data[["country_agg"]] = data[["country_agg"]].astype('category')
+    data[["Q_Language"]] = data[["Q_Language"]].astype('category')
+    
+    # Removing very high values as theses are likely measurement errors and prevent
+    # the code from running
+    data[["B2"]] = data[["B2"]].astype('float') # 'For how many days have you had at least one of these symptoms?'
+    data.loc[(data["B2"] > 1000), 'B2'] = -99   #        Covid didn't start until December 2019 at the earliest (ca. 250 days)
+    data[["B4"]] = data[["B4"]].astype('float') # 'How many people do you know with these symptoms?'
+    data.loc[(data["B4"] > 1000), 'B4'] = -99   #        Highly unlikely the respondent knows more than 1000 people
+    data[["E5"]] = data[["E5"]].astype('float') # 'How many people slept in the place where you stayed last night (including yourself)?'
+    data.loc[(data["E5"] > 1000), 'E5'] = -99   #        Highly unlikely more than 1000 people slept in the same place last night
+    data[["E6"]] = data[["E6"]].astype('float') # 'How many years of education have you completed?'
+    data.loc[(data["E6"] > 1000), 'E6'] = -99   #        Held at 1000 for consistency
+    data[["weight"]] = data[["weight"]].astype('float')
+    
+    spop = Synthpop(method = "cart", seed = 123)
+    spop.fit(data, dtypes2)
+    gen = spop.generate(len(data))
+    gen.to_csv(var1 + var2 + var3 + var4, index = False)
+    
+    spop = Synthpop(method = "sample", seed = 123)
+    spop.fit(data, dtypes2)
+    gen = spop.generate(len(data))
+    gen.to_csv(var1 + var2 + var3 + var5, index = False)
+```
+
+
+# R - Synthetic data: Swapping
+``` {r Synthetic data: Swapping}
+
+for (i in seq_len(dayNum)) {
+  date <- as.Date(startDate)
+  date <- date + days(i) - days(1)
+    
+  OrigData <- read.csv(file.path(getwd(),
+                                 "removed_files",
+                                 sprintf("%s_parta_rm.csv", date))
+                       )
+  
+  # See {python Synthetic data: CART & Sample} for justification
+  OrigData[OrigData$B2 > 1000,] <- -99
+  OrigData[OrigData$B4 > 1000,] <- -99
+  OrigData[OrigData$E5 > 1000,] <- -99
+  OrigData[OrigData$E6 > 1000,] <- -99
+    
+  SynthData <- OrigData
+  for (i in seq_len(length(names(OrigData)))) {
+    set.seed(i)
+    SynthData[, i] <- OrigData[, i][order(rnorm(length(OrigData[, i])))]
+  }
+  
+  write.csv(SynthData, 
+            file = file.path(getwd(),
+                             "synthetic_files",
+                             sprintf("%s_parta_rm_synthSWAP.csv", date)),
+            row.names = FALSE)
+}
+```
+
+
+# Python - Synthetic data: CART & Sample (28 days)
+``` {python Synthetic data: CART & Sample (28 days), eval = FALSE}
+import os
+import numpy as np
+import pandas as pd
+from synthpop import Synthpop
+from datetime import date, timedelta
+
+dtypes2 = {'RecordedDate': 'category', 'survey_version': 'int', 'survey_region': 'category', 'weight': 'float', 'Finished': 'int','intro1': 'int', 'intro2': 'int', 'A1': 'int',  'A2_2_1': 'int', 'A2_2_2': 'int', 'B1_1': 'int', 'B1_2': 'int', 'B1_3': 'int', 'B1_4': 'int', 'B1_5': 'int', 'B1_6': 'int', 'B1_7': 'int', 'B1_8': 'int', 'B1_9': 'int', 'B1_10': 'int', 'B1_11': 'int', 'B1_12': 'int', 'B1_13': 'int', 'B2': 'float', 'B1b_x1': 'int', 'B1b_x2': 'int', 'B1b_x3': 'int', 'B1b_x4': 'int', 'B1b_x5': 'int', 'B1b_x6': 'int', 'B1b_x7': 'int', 'B1b_x8': 'int', 'B1b_x9': 'int', 'B1b_x10': 'int', 'B1b_x11': 'int', 'B1b_x12': 'int', 'B1b_x13': 'int', 'B3': 'int', 'B4': 'float', 'B5': 'int', 'B6': 'int', 'B7': 'int', 'B8': 'int', 'B9': 'int', 'B10': 'int', 'B11': 'int', 'B12_1': 'int', 'B12_2': 'int', 'B12_3': 'int', 'B12_4': 'int', 'B12_5': 'int', 'B12_6': 'int', 'B13_1': 'int', 'B13_2': 'int', 'B13_3': 'int', 'B13_4': 'int', 'B13_5': 'int', 'B13_6': 'int', 'B13_7': 'int', 'B14_1': 'int', 'B14_2': 'int', 'B14_3': 'int', 'B14_4': 'int', 'B14_5': 'int', 'C0_1': 'int', 'C0_2': 'int', 'C0_3': 'int', 'C0_4': 'int', 'C0_5': 'int', 'C0_6': 'int', 'C1_m': 'int', 'C2': 'int', 'C7': 'int', 'C8': 'int', 'C3': 'int', 'C5': 'int', 'C6': 'int', 'D1': 'int', 'D2': 'int', 'D3': 'int', 'D4': 'int', 'D5': 'int', 'D6_1': 'int', 'D6_2': 'int', 'D6_3': 'int', 'D7': 'int', 'D8': 'int', 'D9': 'int', 'D10': 'int', 'E3': 'int', 'E4': 'int', 'E6': 'float', 'E2': 'int', 'E5': 'float', 'E7': 'int', 'F1': 'int', 'F2_1': 'int', 'F2_2': 'int', 'Q_Language': 'category', 'Q_TotalDuration': 'int', 'country_agg': 'category', 'X1w_0unw': 'int'}
+
+data = pd.read_csv(os.path.join(os.getcwd(), "removed_files", "All_Removed_Combined.csv"))
+
+# By default, these variables are coded as type 'o'. Synthpop doesn't recognise
+# this, however, so changing it to category which should just be a different name
+data[["survey_region"]] = data[["survey_region"]].astype('category')
+data[["RecordedDate"]] = data[["RecordedDate"]].astype('category')
+data[["country_agg"]] = data[["country_agg"]].astype('category')
+data[["Q_Language"]] = data[["Q_Language"]].astype('category')
+
+# Removing very high values as theses are likely measurement errors and prevent
+# the code from running
+data[["B2"]] = data[["B2"]].astype('float') # 'For how many days have you had at least one of these symptoms?'
+data.loc[(data["B2"] > 1000), 'B2'] = -99   #        Covid didn't start until December 2019 at the earliest (ca. 250 days)
+data[["B4"]] = data[["B4"]].astype('float') # 'How many people do you know with these symptoms?'
+data.loc[(data["B4"] > 1000), 'B4'] = -99   #        Highly unlikely the respondent knows more than 1000 people
+data[["E5"]] = data[["E5"]].astype('float') # 'How many people slept in the place where you stayed last night (including yourself)?'
+data.loc[(data["E5"] > 1000), 'E5'] = -99   #        Highly unlikely more than 1000 people slept in the same place last night
+data[["E6"]] = data[["E6"]].astype('float') # 'How many years of education have you completed?'
+data.loc[(data["E6"] > 1000), 'E6'] = -99   #        Held at 1000 for consistency
+data[["weight"]] = data[["weight"]].astype('float')
+
+spop = Synthpop(method = "cart", seed = 123)
+spop.fit(data, dtypes2)
+gen = spop.generate(len(data))
+gen.to_csv(os.path.join(os.getcwd(), "synthetic_files", "CombinedCART.csv"), index = False)
+
+spop = Synthpop(method = "sample", seed = 123)
+spop.fit(data, dtypes2)
+gen = spop.generate(len(data))
+gen.to_csv(os.path.join(os.getcwd(), "synthetic_files", "CombinedSAMPLE.csv"), index = False)
+```
+
+
+
+# R - Synthetic data: Swapping (28 days)
+``` {r Synthetic data: Swapping (28 days)}
+
+OrigData <- read.csv(file.path(getwd(),
+                               "removed_files",
+                               "All_Removed_Combined.csv")
+                     )
+
+# See {python Synthetic data: CART & Sample} for justification
+OrigData[OrigData$B2 > 1000,] <- -99
+OrigData[OrigData$B4 > 1000,] <- -99
+OrigData[OrigData$E5 > 1000,] <- -99
+OrigData[OrigData$E6 > 1000,] <- -99
+  
+SynthData <- OrigData
+for (i in seq_len(length(names(OrigData)))) {
+  set.seed(i)
+  SynthData[, i] <- OrigData[, i][order(rnorm(length(OrigData[, i])))]
+}
+
+write.csv(SynthData, 
+          file = file.path(getwd(),
+                           "synthetic_files",
+                           "CombinedSWAP.csv"),
+          row.names = FALSE)
+```
+
+# Utility
+
+# R - Utility Evaluation (28 days)
+```{r Utility Evaluation (28 days)}
+
+need <- c("doParallel",
+          "foreach",
+          "lubridate",
+          "synthpop",
+          "tidyverse")
+have <- need %in% rownames(installed.packages())
+if(any(!have)) install.packages(need[!have])
+invisible(lapply(need, library, character.only = TRUE))
+
+rm(need, have)
+
+startDate <- "2020-07-01"
+endDate <- "2020-07-28"
+dayNum <- as.numeric(difftime(endDate, startDate, units = "days")) + 1
+
+SWITCH <- 0
+
+
+if ( SWITCH == 1) {
+  myCluster <- makeCluster(28, # Number of cores to use
+                           type = "PSOCK")
+  registerDoParallel(myCluster)
+  
+  foreach(i = 1:28) %dopar% {
+    # PSOCK creates a new instance of R which cannot access libraries or variables
+    # loaded previously. For this reason, variables such as startDate need to be 
+    # hardcoded and functions that are part of packages referenced directly using
+    # PACKAGE::FUNCTION and packages installed and imported manually
+        
+    need <- c("lubridate",
+              "synthpop",
+              "tidyverse")
+    have <- need %in% rownames(installed.packages())
+    if(any(!have)) install.packages(need[!have])
+    invisible(lapply(need, library, character.only = TRUE))
+    
+    rm(need, have)
+
+    date <- as.Date(startDate)
+    date <- date + lubridate::days(i) - lubridate::days(1)
+    
+    OrigData <- read.csv(file.path(getwd(),
+                                   "removed_files",
+                                   sprintf("%s_parta_rm.csv", date))
+                         )
+    SynthData <- read.csv(file.path(getwd(),
+                                   "synthetic_files",
+                                   sprintf("%s_parta_rm_synthCART.csv", date))
+                         )
+    
+    # Applying adjustments made for synthetic data generation. See {python Synthetic data: CART & Sample}
+    # for justification
+    OrigData[OrigData$B2 > 1000,] <- -99
+    OrigData[OrigData$B4 > 1000,] <- -99
+    OrigData[OrigData$E5 > 1000,] <- -99
+    OrigData[OrigData$E6 > 1000,] <- -99
+    
+    # A few columns were identified as problematic because they exhibit different counts of factor levels.
+    # This is adjusted manually here
+    problematic_columns <- c('Q_Language', 'country_agg', 'survey_region', 'RecordedDate')
+    for (tmp in problematic_columns) {
+      if (all(levels(as.factor(OrigData[, tmp])) == levels(as.factor(SynthData[, tmp])))) {
+        OrigData[, tmp] <- as.factor(OrigData[, tmp])
+        SynthData[, tmp] <- as.factor(SynthData[, tmp])
+      } else {
+        LEVEL <- union(levels(as.factor(OrigData[, tmp])), levels(as.factor(SynthData[, tmp])))
+        OrigData[, tmp] <- factor(OrigData[, tmp], levels = LEVEL)
+        SynthData[, tmp] <- factor(SynthData[, tmp], levels = LEVEL)
+      }
+    }
+    
+    # exclude single unique values
+    singleValueCol <- apply(SynthData, MARGIN = 2, function(x) length(unique(x)) == 1)
+    OrigData <- OrigData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    SynthData <- SynthData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    
+    set.seed(i) # Ensure reproducibility
+
+    Comp <- compare(OrigData, SynthData, stat = "counts", table = TRUE)
+    Util <- utility.gen(OrigData, SynthData)
+    Table <- utility.tables(OrigData, SynthData, tables = "twoway")
+
+    saveRDS(Util, file = sprintf("CART_Utility_%s.Rds", date))
+    saveRDS(Comp, file = sprintf("CART_Comp_%s.Rds", date))
+    saveRDS(Table, sprintf("CART_Table_%s.Rds", date))
+    }
+  
+  stopCluster(myCluster)
+  
+  rm(myCluster)
+} else {print("CART switch turned off")}
+
+
+
+## Sample
+
+if ( SWITCH == 1) {
+  myCluster <- makeCluster(28, # Number of cores to use
+                           type = "PSOCK")
+  registerDoParallel(myCluster)
+  
+  foreach(i = 1:28) %dopar% {
+    # PSOCK creates a new instance of R which cannot access libraries or variables
+    # loaded previously. For this reason, variables such as startDate need to be 
+    # hardcoded and functions that are part of packages referenced directly using
+    # PACKAGE::FUNCTION
+        
+    need <- c("lubridate",
+              "synthpop",
+              "tidyverse")
+    have <- need %in% rownames(installed.packages())
+    if(any(!have)) install.packages(need[!have])
+    invisible(lapply(need, library, character.only = TRUE))
+    
+    rm(need, have)
+
+    date <- as.Date(startDate)
+    date <- date + lubridate::days(i) - lubridate::days(1)
+    
+    OrigData <- read.csv(file.path(getwd(),
+                                   "removed_files",
+                                   sprintf("%s_parta_rm.csv", date))
+                         )
+    SynthData <- read.csv(file.path(getwd(),
+                                   "synthetic_files",
+                                   sprintf("%s_parta_rm_synthSAMPLE.csv", date))
+                         )
+    
+    # Applying adjustments made for synthetic data generation. See {python Synthetic data: CART & Sample}
+    # for justification
+    OrigData[OrigData$B2 > 1000,] <- -99
+    OrigData[OrigData$B4 > 1000,] <- -99
+    OrigData[OrigData$E5 > 1000,] <- -99
+    OrigData[OrigData$E6 > 1000,] <- -99
+    
+    # A few columns were identified as problematic because they exhibit different counts of factor levels.
+    # This is adjusted manually here
+    problematic_columns <- c('Q_Language', 'country_agg', 'survey_region', 'RecordedDate')
+    for (tmp in problematic_columns) {
+      if (all(levels(as.factor(OrigData[, tmp])) == levels(as.factor(SynthData[, tmp])))) {
+        OrigData[, tmp] <- as.factor(OrigData[, tmp])
+        SynthData[, tmp] <- as.factor(SynthData[, tmp])
+      } else {
+        LEVEL <- union(levels(as.factor(OrigData[, tmp])), levels(as.factor(SynthData[, tmp])))
+        OrigData[, tmp] <- factor(OrigData[, tmp], levels = LEVEL)
+        SynthData[, tmp] <- factor(SynthData[, tmp], levels = LEVEL)
+      }
+    }
+    
+    # exclude single unique values
+    singleValueCol <- apply(SynthData, MARGIN = 2, function(x) length(unique(x)) == 1)
+    OrigData <- OrigData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    SynthData <- SynthData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    
+    set.seed(i) # Ensure reproducibility
+
+    Comp <- compare(OrigData, SynthData, stat = "counts", table = TRUE)
+    Util <- utility.gen(OrigData, SynthData)
+    Table <- utility.tables(OrigData, SynthData, tables = "twoway")
+
+    saveRDS(Util, file = sprintf("SAMPLE_Utility_%s.Rds", date))
+    saveRDS(Comp, file = sprintf("SAMPLE_Comp_%s.Rds", date))
+    saveRDS(Table, sprintf("SAMPLE_Table_%s.Rds", date))
+    }
+  
+  stopCluster(myCluster)
+  
+  rm(myCluster)
+} else {print("SAMPLE switch turned off")}
+
+
+## Swap
+
+if ( SWITCH == 1) {
+  myCluster <- makeCluster(28, # Number of cores to use
+                           type = "PSOCK")
+  registerDoParallel(myCluster)
+  
+  foreach(i = 1:28) %dopar% {
+    # PSOCK creates a new instance of R which cannot access libraries or variables
+    # loaded previously. For this reason, variables such as startDate need to be 
+    # hardcoded and functions that are part of packages referenced directly using
+    # PACKAGE::FUNCTION
+        
+    need <- c("lubridate",
+              "synthpop",
+              "tidyverse")
+    have <- need %in% rownames(installed.packages())
+    if(any(!have)) install.packages(need[!have])
+    invisible(lapply(need, library, character.only = TRUE))
+    
+    rm(need, have)
+
+    date <- as.Date(startDate)
+    date <- date + lubridate::days(i) - lubridate::days(1)
+    
+    OrigData <- read.csv(file.path(getwd(),
+                                   "removed_files",
+                                   sprintf("%s_parta_rm.csv", date))
+                         )
+    SynthData <- read.csv(file.path(getwd(),
+                                   "synthetic_files",
+                                   sprintf("%s_parta_rm_synthSWAP.csv", date))
+                         )
+    
+    # Applying adjustments made for synthetic data generation. See {python Synthetic data: CART & Sample}
+    # for justification
+    OrigData[OrigData$B2 > 1000,] <- -99
+    OrigData[OrigData$B4 > 1000,] <- -99
+    OrigData[OrigData$E5 > 1000,] <- -99
+    OrigData[OrigData$E6 > 1000,] <- -99
+    
+    # A few columns were identified as problematic because they exhibit different counts of factor levels.
+    # This is adjusted manually here
+    problematic_columns <- c('Q_Language', 'country_agg', 'survey_region', 'RecordedDate')
+    for (tmp in problematic_columns) {
+      if (all(levels(as.factor(OrigData[, tmp])) == levels(as.factor(SynthData[, tmp])))) {
+        OrigData[, tmp] <- as.factor(OrigData[, tmp])
+        SynthData[, tmp] <- as.factor(SynthData[, tmp])
+      } else {
+        LEVEL <- union(levels(as.factor(OrigData[, tmp])), levels(as.factor(SynthData[, tmp])))
+        OrigData[, tmp] <- factor(OrigData[, tmp], levels = LEVEL)
+        SynthData[, tmp] <- factor(SynthData[, tmp], levels = LEVEL)
+      }
+    }
+    
+    # exclude single unique values
+    singleValueCol <- apply(SynthData, MARGIN = 2, function(x) length(unique(x)) == 1)
+    OrigData <- OrigData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    SynthData <- SynthData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    
+    set.seed(i) # Ensure reproducibility
+
+    # exclude single unique values
+    Comp <- compare(OrigData, SynthData, stat = "counts", table = TRUE)
+    Util <- utility.gen(OrigData, SynthData)
+    Table <- utility.tables(OrigData, SynthData, tables = "twoway")
+
+    saveRDS(Util, file = sprintf("SWAP_Utility_%s.Rds", date))
+    saveRDS(Comp, file = sprintf("SWAP_Comp_%s.Rds", date))
+    saveRDS(Table, sprintf("SWAP_Table_%s.Rds", date))
+    }
+  
+  stopCluster(myCluster)
+  
+  rm(myCluster)
+} else {print("SWAP switch turned off")}
+
+```
+
+
+# R - Utility Evaluation (single day)
+```{r Utility Evaluation (single day)}
+
+need <- c("doParallel",
+          "foreach",
+          "lubridate",
+          "synthpop",
+          "tidyverse")
+have <- need %in% rownames(installed.packages())
+if(any(!have)) install.packages(need[!have])
+invisible(lapply(need, library, character.only = TRUE))
+
+rm(need, have)
+
+SWITCH <- 0
+
+methods <- c("CART", "SAMPLE", "SWAP")
+
+if ( SWITCH == 1) {
+  myCluster <- makeCluster(3, # Number of cores to use
+                           type = "PSOCK")
+  registerDoParallel(myCluster)
+  
+  foreach(i = 1:3) %dopar% {
+    # PSOCK creates a new instance of R which cannot access libraries or variables
+    # loaded previously. For this reason, variables such as startDate need to be 
+    # hardcoded and functions that are part of packages referenced directly using
+    # PACKAGE::FUNCTION and packages installed and imported manually
+        
+    need <- c("lubridate",
+              "synthpop",
+              "tidyverse")
+    have <- need %in% rownames(installed.packages())
+    if(any(!have)) install.packages(need[!have])
+    invisible(lapply(need, library, character.only = TRUE))
+    
+    rm(need, have)
+    
+    OrigData <- read.csv(file.path(getwd(), "All_Removed_Combined.csv"))
+    SynthData <- read.csv(file.path(getwd(), sprintf("Combined%s.csv", methods[i])))
+    
+    # Applying adjustments made for synthetic data generation. See {python Synthetic data: CART & Sample}
+    # for justification
+    OrigData[OrigData$B2 > 1000,] <- -99
+    OrigData[OrigData$B4 > 1000,] <- -99
+    OrigData[OrigData$E5 > 1000,] <- -99
+    OrigData[OrigData$E6 > 1000,] <- -99
+    
+    # A few columns were identified as problematic because they exhibit different counts of factor levels.
+    # This is adjusted manually here
+    problematic_columns <- c('Q_Language', 'country_agg', 'survey_region', 'RecordedDate')
+    for (tmp in problematic_columns) {
+      if (all(levels(as.factor(OrigData[, tmp])) == levels(as.factor(SynthData[, tmp])))) {
+        OrigData[, tmp] <- as.factor(OrigData[, tmp])
+        SynthData[, tmp] <- as.factor(SynthData[, tmp])
+      } else {
+        LEVEL <- union(levels(as.factor(OrigData[, tmp])), levels(as.factor(SynthData[, tmp])))
+        OrigData[, tmp] <- factor(OrigData[, tmp], levels = LEVEL)
+        SynthData[, tmp] <- factor(SynthData[, tmp], levels = LEVEL)
+      }
+    }
+    
+    # exclude single unique values
+    singleValueCol <- apply(SynthData, MARGIN = 2, function(x) length(unique(x)) == 1)
+    OrigData <- OrigData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    SynthData <- SynthData %>% select(-c(names(SynthData[which(singleValueCol)])))
+    
+    set.seed(i) # Ensure reproducibility
+
+    Comp <- compare(OrigData, SynthData, stat = "counts", table = TRUE)
+    Util <- utility.gen(OrigData, SynthData)
+    Table <- utility.tables(OrigData, SynthData, tables = "twoway")
+
+    saveRDS(Util, file = sprintf("Utility_%s.Rds", method[i]))
+    saveRDS(Comp, file = sprintf("Comp_%s.Rds", method[i]))
+    saveRDS(Table, sprintf("Table_%s.Rds", method[i]))
+    }
+  
+  stopCluster(myCluster)
+  
+  rm(myCluster)
+} else {print("Utility switch turned off")}
+
+```
+
+# Risk
+Even though we created fully synthetic data it is necessary to take a look at the risk of our dataset. Our approach to evaluate the risk of the synthetic data is to check if any rows appear exactly the same in both the original data and the synthetic data.
+
+# R - Risk evaluation: Perceived
+```{r Risk evaluation: Perceived}
+
+methods <- c("CART", "SAMPLE", "SWAP")
+results <- data.frame("Date" = NA, "Observations" = NA, "CART" = NA, "SAMPLE" = NA, "SWAP" = NA)
+
+for (method in methods){
+  for (i in seq_len(dayNum)) {
+    date <- as.Date(startDate)
+    date <- date + lubridate::days(i) - lubridate::days(1)
+    
+    OrigData <- read.csv(file.path(getwd(),
+                                   "removed_files",
+                                   sprintf("%s_parta_rm.csv", date))
+                         )
+    SynthData <- read.csv(file.path(getwd(),
+                                   "synthetic_files",
+                                   sprintf("%s_parta_rm_synth%s.csv", date, method))
+                         )
+    
+    # Applying adjustments made for synthetic data generation. See {python Synthetic data: CART & Sample}
+    # for justification
+    OrigData[OrigData$B2 > 1000,] <- -99
+    OrigData[OrigData$B4 > 1000,] <- -99
+    OrigData[OrigData$E5 > 1000,] <- -99
+    OrigData[OrigData$E6 > 1000,] <- -99
+    
+    if (method == "CART"){
+        results[i, "Date"] <- as.character(date)
+      results[i, "Observations"] <- dim(OrigData)[1]
+    }
+    # Checking for the number of rows that are exactly the same in both the original data
+    # and the synthetic data. This is most likely due to chance
+    results[i, method] <- dim(inner_join(OrigData, SynthData))[1]
+  }
+}
+
+write.csv(results, file = "PerceivedRisk.csv", row.names = FALSE)
+
+rm(OrigData, SynthData, method, i)
+
+```
+
+# Future aspects: Differential Privacy
+
+We mainly focused on the general case of synthetic data, but for future research this type of analysis can also be made for differential privacy. Differential privacy is a type of system where information about a dataset is publicly shared while the information of each individual is withhold. Therefore the privacy of each individual can be maintained.
+This can be achieved with the following idea:
+
+```{r Future aspects: Differential Privacy}
+synipf <- syn(OrigData, method= "ipf", ipf.priorn = 0, ipf.epsilon = 1)
+ru_S7_1 <- replicated.uniques(synipf, OrigData)$per.replications
+util_S7_2way <- mean(utility.tables(synipf, OrigData, "twoway", plot = FALSE)$tabs[,2])
+```
+
+The method “ipf” implements a fit to the table which is obtained from the log-linear fit that matches the numbers in the margins specified by the margin parameters. The variables should be categorical, but still can also used for numerical variables in case they are categorized by specifying them in the numtocat parameter. The utility can also be drawn likewise as the general case of synthetic data.
+
+#
+#
+#
+# END
+#
+#
+#
